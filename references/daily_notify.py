@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 
 # ===== 配置（通过环境变量） =====
 WECOM_WEBHOOK = os.environ.get('CMCC_WEBHOOK', '')
+SAVE_DIR = os.path.expanduser('~/标讯/移动')
 STATE_FILE = os.environ.get('CMCC_STATE_FILE', '/tmp/cmcc_daily_state.json')
 
 API_LIST = 'https://b2b.10086.cn/api-b2b/api-sync-es/white_list_api/b2b/publish/queryList'
@@ -27,9 +28,10 @@ SEC_KW = [
     '僵木蠕',
     '个人信息保护',
 ]
-EXC = ['视频监控','防雷检测','电力监控','碳减排','安全生产','碳中和','交通安全','道路交通',
+EXC = ['视频监控','防雷','防雷检测','电力监控','碳减排','安全生产','碳中和','交通安全','道路交通',
        '地震安全','功能安全','内容安全','消防安全','电气安全','食品安全','施工安全',
-       '反诈宣传']
+       '反诈宣传', '燃气安全', '质量安全',
+       '存货盘点合规审计', '合规审计支撑', '反贿赂', '管理体系认证']
 
 
 def curl_post(url, payload, timeout=30):
@@ -43,6 +45,52 @@ def curl_post(url, payload, timeout=30):
     except Exception as e:
         print(f"[curl_post错误] {e}", file=sys.stderr)
     return {}
+
+
+def sanitize_filename(title, max_len=40):
+    """生成安全的文件名"""
+    s = re.sub(r'[\\/:*?"<>|\n\r\t]', '', title)
+    s = s.strip().replace(' ', '_')
+    return s[:max_len]
+
+
+def save_to_md(item, detail_text, typ, idx, total):
+    """保存单条标讯为 md 文件"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    day_dir = os.path.join(SAVE_DIR, today)
+    os.makedirs(day_dir, exist_ok=True)
+
+    title = item.get('name', '无标题')
+    unit = item.get('companyTypeName', '')
+    ct = item.get('publishDate', '')
+    nt = item.get('_nt', '')
+    vendor_key = {'SELECTION_RESULTS': 'vendors', 'CANDIDATE_PUBLICITY': 'candidates', 'PROCUREMENT': 'max_price'}.get(nt, 'vendors')
+    vs = '、'.join(item.get('vendors', item.get('candidates', item.get('max_price', ['-'])))) if isinstance(item.get(vendor_key), list) else item.get(vendor_key, '-')
+    atype = {'SELECTION_RESULTS': '中选结果', 'CANDIDATE_PUBLICITY': '候选人公示', 'PROCUREMENT': '采购公告'}.get(nt, nt)
+    link = f"https://b2b.10086.cn/#/noticeDetail?publishId={item['id']}&publishUuid={item['uuid']}&publishType=PROCUREMENT&publishOneType={nt}"
+
+    fname = f"{idx:02d}_{sanitize_filename(title)}.md"
+    fpath = os.path.join(day_dir, fname)
+
+    body = detail_text if detail_text else "无PDF内容"
+
+    md = f"""# {title}
+
+- **单位:** {unit}
+- **类型:** {atype}
+- **时间:** {ct}
+- **厂商/候选人/价格:** {vs}
+- **详情链接:** {link}
+
+---
+
+## 公告正文 (PDF提取)
+
+{body}
+"""
+    with open(fpath, "w", encoding="utf-8") as f:
+        f.write(md)
+    print(f"  \U0001f4be 保存: {fpath}", file=sys.stderr)
 
 
 def escape_md_v2(text):
@@ -70,20 +118,67 @@ def send_wecom(msg):
         stdout, _ = proc.communicate(timeout=15)
         print(f"[WeCom] 1/1片: {stdout.decode('utf-8', errors='ignore')[:100]}")
         return
-    # 超过4096字节，按行分片
-    max_bytes = 4000
+    # 按 section 分片，单 section 超限时回退按行拆
+    max_bytes = 3800
+    sections = re.split(r'\n(?=\*\*)', msg)
+    header_part = sections[0]
+    body_sections = sections[1:]
+    
     chunks = []
-    current = ''
-    for line in msg.split('\n'):
-        test = current + '\n' + line if current else line
+    current = header_part
+    for sec in body_sections:
+        test = current + '\n' + sec
         if len(test.encode('utf-8')) > max_bytes:
-            if current:
-                chunks.append(current)
-            current = line
+            if current.strip():
+                chunks.append(current.rstrip())
+            # 单 section 超限 → 按子 section 再拆（每个子标题有自己表头）
+            if len(sec.encode('utf-8')) > max_bytes:
+                sub_secs = re.split(r'\n(?=\*\*)', sec)
+                for ss in sub_secs:
+                    if not ss.strip():
+                        continue
+                    t = current + '\n' + ss if current.strip() else ss
+                    if len(t.encode('utf-8')) > max_bytes:
+                        if current.strip():
+                            chunks.append(current.rstrip())
+                        if len(ss.encode('utf-8')) > max_bytes:
+                            lines = ss.split('\n')
+                            table_header, rest_lines, found = [], [], False
+                            for ln in lines:
+                                if not found and ln.startswith('|'):
+                                    table_header.append(ln)
+                                    if len(table_header) >= 2:
+                                        found = True
+                                elif found:
+                                    rest_lines.append(ln)
+                                else:
+                                    table_header.append(ln)
+                            sub_lines = table_header + rest_lines
+                            sub = ''
+                            # 完整表头：section标题 + 列头 + 分隔行（需重建时携带）
+                            full_header = table_header[:]
+                            if rest_lines and rest_lines[0].startswith('|'):
+                                full_header.append(rest_lines[0])
+                            for ln in sub_lines:
+                                t2 = sub + '\n' + ln if sub else ln
+                                if len(t2.encode('utf-8')) > max_bytes:
+                                    if sub.strip():
+                                        chunks.append(sub.rstrip())
+                                    # 重建表头：确保第二片以后每个子片都有完整表头（含|---|分隔行）
+                                    sub = '\n'.join(full_header) + '\n' + ln
+                                else:
+                                    sub = t2
+                            current = sub if sub.strip() else ''
+                        else:
+                            current = ss
+                    else:
+                        current = t
+            else:
+                current = sec
         else:
             current = test
-    if current:
-        chunks.append(current)
+    if current.strip():
+        chunks.append(current.rstrip())
     
     for i, chunk in enumerate(chunks):
         payload = {"msgtype":"markdown_v2","markdown_v2":{"content":chunk[:4096]}}
@@ -139,32 +234,32 @@ def extract_candidates(text):
     """候选人公示 → 候选人列表（支持多种格式）"""
     res = []
     
-    # 格式1: 标包N第一名 公司名...
-    for m in re.finditer(r'标包(\d+)(?:名称)?\s*第一名\s*([^\d\n]{4,60}?)(?:未含税|不含税|含税|\d|$)', text):
+    # 格式1: 标包N 第X名 公司名...（匹配所有名次）
+    for m in re.finditer(r'标包(\d+)(?:名称)?\s*(?:第[一二三四五六七八九十\d]+名)\s*([^\d\n]{4,60}?)(?:未含税|不含税|含税|\d|$)', text):
         pkg, name = m.group(1), m.group(2).strip()
-        if name and len(name) > 3:
-            res.append(f"标包{pkg}: {name}")
+        if name and 3 < len(name) < 60:
+            candidate = f"标包{pkg}: {name}"
+            if candidate not in res:
+                res.append(candidate)
     
-    # 格式2: 第一名 公司名...（无标包号）
-    if not res:
-        for m in re.finditer(r'第一名\s*([^\d\n]{4,60}?)(?:未含税|不含税|含税|\d|$)', text):
-            name = m.group(1).strip()
-            if name and len(name) > 3:
-                res.append(name)
+    # 格式2: 第X名 公司名...（无标包号或同一标包内第2名之后）
+    # 始终执行，不设 if not res 守卫
+    for m in re.finditer(r'(?:第[一二三四五六七八九十\d]+名)\s*([^\d\n]{4,60}?)(?:未含税|不含税|含税|\d|$)', text):
+        name = m.group(1).strip()
+        if name and 3 < len(name) < 60 and name not in res:
+            res.append(name)
     
-    # 格式3: 原有格式
-    if not res:
-        for m in re.finditer(r'标包(\d+)(?:名称)?\s*(?:第[一二三四五六七八九十1234567890]+名|[1-9]\.)\s*([^\d\n]{4,40}?)(?:\s+\d)', text):
-            res.append(f"标包{m.group(1)}: {m.group(2).strip()}")
+    # 格式3: 清理 / 噪音 + 去重（按公司名核心部分去重）
+    cleaned = []
+    for r in res:
+        r = re.sub(r'\s*/\s*满足.*$', '', r).strip()
+        r = re.sub(r'\s*/\s*采购包.*$', '', r).strip()
+        # 去重：检查是否已有相同公司名（去除标包前缀后比较）
+        core = re.sub(r'^标包\d+:?\s*', '', r)
+        if r and not any(re.sub(r'^标包\d+:?\s*', '', c) == core for c in cleaned):
+            cleaned.append(r)
     
-    # 格式4: 无标包号
-    if not res:
-        for m in re.finditer(r'(?:第[一二三四五六七八九十1234567890]+名|[1-9]\.)\s*([^\d\n]{4,40}?)(?:\s+\d)', text):
-            n = m.group(1).strip()
-            if n not in res:
-                res.append(n)
-    
-    return res[:5] or ['-']
+    return cleaned[:5] or ['-']
 
 
 def extract_price(text):
@@ -192,7 +287,7 @@ def make_link(item, nt):
 
 
 def main():
-    cutoff = (datetime.now() - timedelta(days=3)).strftime('%Y-%m-%d')
+    cutoff = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
     print(f"查询范围: {cutoff} ~ 今日")
 
     items = {}
@@ -216,12 +311,18 @@ def main():
 
     print(f"中选结果{len(sel)} | 采购公告{len(proc)} | 候选人{len(cand)}")
 
-    for item in sel:
-        item['vendors'] = extract_vendors(get_text(item))
-    for item in cand:
-        item['candidates'] = extract_candidates(get_text(item))
-    for item in proc:
-        item['max_price'] = extract_price(get_text(item))
+    for i, item in enumerate(sel, 1):
+        txt = get_text(item)
+        item['vendors'] = extract_vendors(txt)
+        save_to_md(item, txt, 'sel', i, len(sel))
+    for i, item in enumerate(cand, 1):
+        txt = get_text(item)
+        item['candidates'] = extract_candidates(txt)
+        save_to_md(item, txt, 'cand', i, len(cand))
+    for i, item in enumerate(proc, 1):
+        txt = get_text(item)
+        item['max_price'] = extract_price(txt)
+        save_to_md(item, txt, 'proc', i, len(proc))
 
     lines = [f"## 📡 中国移动标讯日报",
              f"**数据范围:** {cutoff} ~ 今日 | **来源:** b2b.10086.cn\n"]
@@ -273,6 +374,25 @@ def main():
 
     lines.append(f"---\n合计: 中选结果{len(sel)}条 | 采购公告{len(proc)}条 | 候选人公示{len(cand)}条")
 
+    # 保存结构化数据供广东日报使用
+    today = datetime.now().strftime("%Y-%m-%d")
+    json_dir = os.path.join(SAVE_DIR, today)
+    os.makedirs(json_dir, exist_ok=True)
+    json_items = []
+    for item in sel:
+            json_items.append({'title': item.get('name',''), 'unit': item.get('companyTypeName',''), 
+                              'vendors': item.get('vendors',[]), 'date': item.get('publishDate',''),
+                              'type': '中选结果', 'id': item.get('id',''), 'uuid': item.get('uuid','')})
+    for item in proc:
+            json_items.append({'title': item.get('name',''), 'unit': item.get('companyTypeName',''),
+                              'price': item.get('max_price','-'), 'date': item.get('publishDate',''),
+                              'type': '采购公告', 'id': item.get('id',''), 'uuid': item.get('uuid','')})
+    for item in cand:
+            json_items.append({'title': item.get('name',''), 'unit': item.get('companyTypeName',''),
+                              'candidates': item.get('candidates',[]), 'date': item.get('publishDate',''),
+                              'type': '候选人公示', 'id': item.get('id',''), 'uuid': item.get('uuid','')})
+    with open(os.path.join(json_dir, '_items.json'), 'w', encoding='utf-8') as f:
+            json.dump(json_items, f, ensure_ascii=False, indent=2)
     send_wecom('\n'.join(lines))
     return 0
 
